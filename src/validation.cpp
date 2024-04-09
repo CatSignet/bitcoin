@@ -2175,6 +2175,7 @@ unsigned int GetBlockScriptFlags(const CBlockIndex& block_index, const Chainstat
     return flags;
 }
 
+static bool ContextualBlockPreCheck(const CBlock& block, BlockValidationState& state, const ChainstateManager& chainman, const CBlockIndex* pindexPrev);
 
 static SteadyClock::duration time_check{};
 static SteadyClock::duration time_forks{};
@@ -2200,6 +2201,10 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
 
     const auto time_start{SteadyClock::now()};
     const CChainParams& params{m_chainman.GetParams()};
+
+    if (!ContextualBlockPreCheck(block, state, m_chainman, pindex->pprev)) {
+        return error("%s: Consensus::ContextualBlockPreCheck: %s", __func__, state.ToString());
+    }
 
     // Check it again in case a previous version let a bad block in
     // NOTE: We don't currently (re-)invoke ContextualCheckBlock() or
@@ -3925,6 +3930,28 @@ static bool ContextualCheckBlockHeader(const CBlockHeader& block, BlockValidatio
     return true;
 }
 
+/**
+ * We want to enforce certain rules (specifically the 64-byte transaction check)
+ * before we call CheckBlock to check the merkle root. This allows us to enforce
+ * malleability checks which may interact with other CheckBlock checks.
+ * This is currently called both in AcceptBlock prior to writing the block to
+ * disk and in ConnectBlock.
+ * Note that as this is called before merkle-tree checks so must never return a
+ * non-malleable error condition.
+ */
+static bool ContextualBlockPreCheck(const CBlock& block, BlockValidationState& state, const ChainstateManager& chainman, const CBlockIndex* pindexPrev)
+{
+    if (DeploymentActiveAfter(pindexPrev, chainman, Consensus::DEPLOYMENT_64BYTETX)) {
+      for (const auto& tx : block.vtx) {
+            if (::GetSerializeSize(TX_NO_WITNESS(tx)) == 64) {
+                return state.Invalid(BlockValidationResult::BLOCK_MUTATED, "64-byte-transaction", strprintf("size of tx %s without witness is 64 bytes", tx->GetHash().ToString()));
+            }
+        }
+    }
+
+    return true;
+}
+
 /** NOTE: This function is not currently invoked by ConnectBlock(), so we
  *  should consider upgrade issues if we change which consensus rules are
  *  enforced in this function (eg by adding a new consensus rule). See comment
@@ -4205,7 +4232,8 @@ bool ChainstateManager::AcceptBlock(const std::shared_ptr<const CBlock>& pblock,
 
     const CChainParams& params{GetParams()};
 
-    if (!CheckBlock(block, state, params.GetConsensus()) ||
+    if (!ContextualBlockPreCheck(block, state, *this, pindex->pprev) ||
+        !CheckBlock(block, state, params.GetConsensus()) ||
         !ContextualCheckBlock(block, state, *this, pindex->pprev)) {
         if (state.IsInvalid() && state.GetResult() != BlockValidationResult::BLOCK_MUTATED) {
             pindex->nStatus |= BLOCK_FAILED_VALID;
@@ -4325,6 +4353,8 @@ bool TestBlockValidity(BlockValidationState& state,
     // NOTE: CheckBlockHeader is called by CheckBlock
     if (!ContextualCheckBlockHeader(block, state, chainstate.m_blockman, chainstate.m_chainman, pindexPrev))
         return error("%s: Consensus::ContextualCheckBlockHeader: %s", __func__, state.ToString());
+    if (!ContextualBlockPreCheck(block, state, chainstate.m_chainman, pindexPrev))
+        return error("%s: Consensus::ContextualBlockPreCheck: %s", __func__, state.ToString());
     if (!CheckBlock(block, state, chainparams.GetConsensus(), fCheckPOW, fCheckMerkleRoot))
         return error("%s: Consensus::CheckBlock: %s", __func__, state.ToString());
     if (!ContextualCheckBlock(block, state, chainstate.m_chainman, pindexPrev))
@@ -4441,6 +4471,11 @@ VerifyDBResult CVerifyDB::VerifyDB(
             return VerifyDBResult::CORRUPTED_BLOCK_DB;
         }
         // check level 1: verify block validity
+        if (nCheckLevel >= 1 && !ContextualBlockPreCheck(block, state, chainstate.m_chainman, pindex->pprev)) {
+            LogPrintf("Verification error: found bad block at %d due to soft-fork, hash=%s (%s)\n",
+                         pindex->nHeight, pindex->GetBlockHash().ToString(), state.ToString());
+            return VerifyDBResult::CORRUPTED_BLOCK_DB;
+        }
         if (nCheckLevel >= 1 && !CheckBlock(block, state, consensus_params)) {
             LogPrintf("Verification error: found bad block at %d, hash=%s (%s)\n",
                       pindex->nHeight, pindex->GetBlockHash().ToString(), state.ToString());
