@@ -13,6 +13,7 @@
 #include <script/miniscript.h>
 #include <script/signingprovider.h>
 #include <script/standard.h>
+#include <script/txhash.h>
 #include <uint256.h>
 #include <util/translation.h>
 #include <util/vector.h>
@@ -25,9 +26,10 @@ MutableTransactionSignatureCreator::MutableTransactionSignatureCreator(const CMu
 {
 }
 
+//TODO(stevenroose) Should the Creator (i.e. it's Checker) have a TxHashCache??
 MutableTransactionSignatureCreator::MutableTransactionSignatureCreator(const CMutableTransaction& tx, unsigned int input_idx, const CAmount& amount, const PrecomputedTransactionData* txdata, int hash_type)
     : m_txto{tx}, nIn{input_idx}, nHashType{hash_type}, amount{amount},
-      checker{txdata ? MutableTransactionSignatureChecker{&m_txto, nIn, amount, *txdata, MissingDataBehavior::FAIL} :
+      checker{txdata ? MutableTransactionSignatureChecker{&m_txto, nIn, amount, *txdata, nullptr, MissingDataBehavior::FAIL} :
                        MutableTransactionSignatureChecker{&m_txto, nIn, amount, MissingDataBehavior::FAIL}},
       m_txdata(txdata)
 {
@@ -299,6 +301,7 @@ static bool SignStep(const SigningProvider& provider, const BaseSignatureCreator
     case TxoutType::WITNESS_UNKNOWN:
     case TxoutType::TX_BARE_DEFAULT_CHECK_TEMPLATE_VERIFY_HASH:
     case TxoutType::ANCHOR:
+    case TxoutType::BARE_CHECK_TXHASH_VERIFY:
         return false;
     case TxoutType::PUBKEY:
         if (!CreateSig(creator, sigdata, provider, sig, CPubKey(vSolutions[0]), scriptPubKey, sigversion)) return false;
@@ -763,6 +766,7 @@ bool SignTransaction(CMutableTransaction& mtx, const SigningProvider* keystore, 
     const CTransaction txConst(mtx);
 
     PrecomputedTransactionData txdata;
+    TxHashCache txhash_cache;
     std::vector<CTxOut> spent_outputs;
     for (unsigned int i = 0; i < mtx.vin.size(); ++i) {
         CTxIn& txin = mtx.vin[i];
@@ -804,7 +808,7 @@ bool SignTransaction(CMutableTransaction& mtx, const SigningProvider* keystore, 
         }
 
         ScriptError serror = SCRIPT_ERR_OK;
-        if (!VerifyScript(txin.scriptSig, prevPubKey, &txin.scriptWitness, STANDARD_SCRIPT_VERIFY_FLAGS, TransactionSignatureChecker(&txConst, i, amount, txdata, MissingDataBehavior::FAIL), &serror)) {
+        if (!VerifyScript(txin.scriptSig, prevPubKey, &txin.scriptWitness, STANDARD_SCRIPT_VERIFY_FLAGS, TransactionSignatureChecker(&txConst, i, amount, txdata, &txhash_cache, MissingDataBehavior::FAIL), &serror)) {
             if (serror == SCRIPT_ERR_INVALID_STACK_OPERATION) {
                 // Unable to sign input and verification failed (possible attempt to partially sign).
                 input_errors[i] = Untranslated("Unable to sign input, invalid stack size (possibly missing key)");

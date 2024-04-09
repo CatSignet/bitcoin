@@ -1008,9 +1008,11 @@ bool MemPoolAccept::PolicyScriptChecks(const ATMPArgs& args, Workspace& ws)
     TxValidationState& state = ws.m_state;
 
     const bool ctv_active = DeploymentActiveAfter(m_active_chainstate.m_chain.Tip(), m_active_chainstate.m_chainman, Consensus::DEPLOYMENT_CHECKTEMPLATEVERIFY);
+    const bool txh_active = DeploymentActiveAfter(m_active_chainstate.m_chain.Tip(), m_active_chainstate.m_chainman, Consensus::DEPLOYMENT_TXHASH);
     const bool apo_active = DeploymentActiveAfter(m_active_chainstate.m_chain.Tip(), m_active_chainstate.m_chainman, Consensus::DEPLOYMENT_ANYPREVOUT);
     const unsigned int scriptVerifyFlags = STANDARD_SCRIPT_VERIFY_FLAGS
         | (ctv_active ? SCRIPT_VERIFY_NONE : SCRIPT_VERIFY_DISCOURAGE_CHECK_TEMPLATE_VERIFY_HASH)
+        | (txh_active ? SCRIPT_VERIFY_NONE : SCRIPT_VERIFY_DISCOURAGE_TXHASH)
         | (apo_active ? SCRIPT_VERIFY_NONE : SCRIPT_VERIFY_DISCOURAGE_ANYPREVOUT);
 
     // Check input scripts and signatures.
@@ -1712,7 +1714,7 @@ void UpdateCoins(const CTransaction& tx, CCoinsViewCache& inputs, CTxUndo &txund
 bool CScriptCheck::operator()() {
     const CScript &scriptSig = ptxTo->vin[nIn].scriptSig;
     const CScriptWitness *witness = &ptxTo->vin[nIn].scriptWitness;
-    return VerifyScript(scriptSig, m_tx_out.scriptPubKey, witness, nFlags, CachingTransactionSignatureChecker(ptxTo, nIn, m_tx_out.nValue, cacheStore, *txdata), &error);
+    return VerifyScript(scriptSig, m_tx_out.scriptPubKey, witness, nFlags, CachingTransactionSignatureChecker(ptxTo, nIn, m_tx_out.nValue, cacheStore, *txdata, txhash_cache), &error);
 }
 
 static CuckooCache::cache<uint256, SignatureCacheHasher> g_scriptExecutionCache;
@@ -1794,6 +1796,9 @@ bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,
     }
     assert(txdata.m_spent_outputs.size() == tx.vin.size());
 
+    //TODO(stevenroose) is there any reason to keep this cache outside this method?
+    // this method is potentially called 3 times though for mempoolaccept..
+    TxHashCache txhash_cache;
     for (unsigned int i = 0; i < tx.vin.size(); i++) {
 
         // We very carefully only pass in things to CScriptCheck which
@@ -1803,7 +1808,7 @@ bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,
         // spent being checked as a part of CScriptCheck.
 
         // Verify signature
-        CScriptCheck check(txdata.m_spent_outputs[i], tx, i, flags, cacheSigStore, &txdata);
+        CScriptCheck check(txdata.m_spent_outputs[i], tx, i, flags, cacheSigStore, &txdata, &txhash_cache);
         if (pvChecks) {
             pvChecks->emplace_back(std::move(check));
         } else if (!check()) {
@@ -1817,7 +1822,7 @@ bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,
                 // non-upgraded nodes by banning CONSENSUS-failing
                 // data providers.
                 CScriptCheck check2(txdata.m_spent_outputs[i], tx, i,
-                        flags & ~STANDARD_NOT_MANDATORY_VERIFY_FLAGS, cacheSigStore, &txdata);
+                        flags & ~STANDARD_NOT_MANDATORY_VERIFY_FLAGS, cacheSigStore, &txdata, &txhash_cache);
                 if (check2())
                     return state.Invalid(TxValidationResult::TX_NOT_STANDARD, strprintf("non-mandatory-script-verify-flag (%s)", ScriptErrorString(check.GetScriptError())));
             }
@@ -2015,6 +2020,11 @@ unsigned int GetBlockScriptFlags(const CBlockIndex& block_index, const Chainstat
     // Enforce ANYPREVOUT (BIP118)
     if ((flags & SCRIPT_VERIFY_TAPROOT) && DeploymentActiveAt(block_index, chainman, Consensus::DEPLOYMENT_ANYPREVOUT)) {
         flags |= SCRIPT_VERIFY_ANYPREVOUT;
+    }
+
+    // Enforce TXHASH
+    if (DeploymentActiveAt(block_index, chainman, Consensus::DEPLOYMENT_TXHASH)) {
+        flags |= SCRIPT_VERIFY_TXHASH;
     }
 
     return flags;
